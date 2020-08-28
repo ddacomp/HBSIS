@@ -1,0 +1,124 @@
+data "template_file" "nginx_server_node_http" {
+  template = "server $${node_ip}:80 max_fails=3 fail_timeout=5s;"
+  count    = "${hcloud_server.k8s.count}"
+
+  vars {
+    node_ip = "${element(hcloud_server.k8s.*.ipv4_address, count.index)}"
+  }
+}
+
+data "template_file" "nginx_server_node" {
+  template = "server $${node_ip}:443 max_fails=3 fail_timeout=5s;"
+  count    = "${hcloud_server.k8s.count}"
+
+  vars {
+    node_ip = "${element(hcloud_server.k8s.*.ipv4_address, count.index)}"
+  }
+}
+
+data "template_file" "nginx_conf" {
+  template = <<EOF
+worker_processes 2;
+worker_rlimit_nofile 20000;
+
+events {
+    worker_connections 4096;
+}
+
+stream {
+    upstream rancher_servers {
+        least_conn;
+        $${servers}
+    }
+    server {
+        listen     443;
+        # https://www.exploit.cz/how-to-solve-kubernetes-ingress-nginx-real-ip/
+        #proxy_protocol        on; #uncomment if you got 127.0.0.1 remote ip issue
+        proxy_pass rancher_servers;
+    }
+    
+    upstream rancher_servers_http {
+        least_conn;
+        $${servers_http}
+    }
+    server {
+        listen     80;
+        # https://www.exploit.cz/how-to-solve-kubernetes-ingress-nginx-real-ip/
+        #proxy_protocol        on; #uncomment if you got 127.0.0.1 remote ip issue
+        proxy_pass rancher_servers_http;
+    }
+    
+}
+EOF
+
+  vars {
+    servers      = "${join("\n        ",  data.template_file.nginx_server_node.*.rendered)}"
+    servers_http = "${join("\n        ", data.template_file.nginx_server_node_http.*.rendered)}"
+  }
+}
+
+resource "null_resource" "configure_lb" {
+  count = "${hcloud_server.lb.count}"
+
+  triggers = {
+    template = "${data.template_file.nginx_conf.rendered}"
+  }
+
+  # provide some connection info
+  connection {
+    type        = "ssh"
+    user        = "root"
+    private_key = "${file(var.ssh_private_key)}"
+    host        = "${element(hcloud_server.lb.*.ipv4_address, count.index)}"
+  }
+
+  provisioner "file" {
+    content     = "${data.template_file.nginx_conf.rendered}"
+    destination = "/srv/nginx-lb.conf"
+  }
+  
+  provisioner "remote-exec" {
+    inline = "docker stop nginx-lb || true && docker rm nginx-lb || true"
+  }
+
+  provisioner "remote-exec" {
+    inline = "docker run --name nginx-lb --restart=always -v /srv/nginx-lb.conf:/etc/nginx/nginx.conf:ro -p 80:80 -p 443:443 -d nginx:alpine"
+  }
+}
+Complete nginx config
+nginx.conf
+
+worker_processes 2;
+worker_rlimit_nofile 20000;
+
+events {
+    worker_connections 4096;
+}
+
+stream {
+    upstream rancher_servers {
+        least_conn;
+        server IP_NODE_1:443 max_fails=3 fail_timeout=5s;
+        server IP_NODE_2:443 max_fails=3 fail_timeout=5s;
+        server IP_NODE_3:443 max_fails=3 fail_timeout=5s;
+    }
+    server {
+        listen     443;
+        # https://www.exploit.cz/how-to-solve-kubernetes-ingress-nginx-real-ip/
+        #proxy_protocol        on; #uncomment if you got 127.0.0.1 remote ip issue
+        proxy_pass rancher_servers;
+    }
+    
+    upstream rancher_servers_http {
+        least_conn;
+        server IP_NODE_1:80 max_fails=3 fail_timeout=5s;
+        server IP_NODE_2:80 max_fails=3 fail_timeout=5s;
+        server IP_NODE_3:80 max_fails=3 fail_timeout=5s;
+    }
+    server {
+        listen     80;
+        # https://www.exploit.cz/how-to-solve-kubernetes-ingress-nginx-real-ip/
+        #proxy_protocol        on; #uncomment if you got 127.0.0.1 remote ip issue
+        proxy_pass rancher_servers_http;
+    }
+}
